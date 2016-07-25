@@ -82,8 +82,7 @@
 (defmethod visit :page [_] nil)
 
 (defmethod visit :ignore [[_ val]]
-  {:type :comment
-   :data val})
+  (str "<!--" val "-->"))
 
 (defmethod visit :default [tree]
   (println (pr-str "No visit method found for " tree)))
@@ -91,77 +90,108 @@
 (def test-file (io/file (io/resource "templates/test.html")))
 
 
-(defn push-on-stack [stack value]
-  (swap! stack conj value))
-
-(defn pop-off-stack [stack]
-  (let [res (peek @stack)]
-    (reset! stack (pop @stack))
-    res))
-
-(defn peek-in-stack [stack] (peek @stack))
-
-(defn handle-comment [stack irep]
-  (println (:type irep)))
+(def state (atom {:components {}
+                  :scope {}}))
 
 (defprotocol ToComponent
-  (^:private to-component [doc stack] "Turn an annotated HTML tree into a ck.theming component"))
+  (^:private to-component [doc] "Turn an annotated HTML tree into a ck.theming component"))
+
+
+(defn new-scope! []
+  (swap! state assoc :scope {:parent (:scope @state)}))
+
+(defn exit-scope! []
+  (swap! state assoc :scope {:parent (:scope @state)}))
+
+(defmulti handle-item
+          (fn [irep _]
+             (:type irep)))
+
+(defmethod handle-item :inComponent [irep target]
+  (let [id (get-in irep [:data :id])
+        sym (symbol (str/lower-case (name id)))]
+    (when (not (get-in @state [:components id]))
+      (swap! state assoc-in [:components id]
+             (concat '(defn)
+                     [sym '[title body]
+                      (to-component target)])))
+    [sym '(:title fields) '(:body fields)]))
+
+(defmethod handle-item :array [irep target]
+  (concat '(for [item ])))
+
+(defmethod handle-item :default [irep _]
+  irep)
 
 (extend-protocol ToComponent
   Document
-  (to-component [doc stack]
-    (-> doc .children first (to-component stack)))
+  (to-component [doc]
+    (-> doc .children first (to-component )))
   Element
-  (to-component [element stack]
+  (to-component [element]
     (let [tag-name (-> element .tagName keyword)
-          attrs (-> element .attributes (to-component stack))
-          some-val (peek-in-stack stack)]
-      (condp = tag-name
-        :head (into [tag-name attrs]
-                    (->> element
-                         .childNodes
-                         (map #(-> % (to-component stack)))
-                         (remove nil?)
-                         vec
-                         not-empty))
-        (into [tag-name attrs]
-              (->> element
-                   .childNodes
-                   (map #(-> % (to-component stack)))
-                   (remove nil?)
-                   vec
-                   not-empty)))))
+          attrs (-> element .attributes (to-component ))]
+      (into [tag-name attrs]
+            (loop [children (->> element .childNodes)
+                   elements []]
+              (if (empty? children)
+                elements
+                (let [result (to-component (first children))]
+                  (if (and (map? result))
+                    (recur (drop 2 children)
+                           (conj elements (handle-item result (second children))))
+                    (recur (rest children)
+                           (conj elements result)))))))
+      ;(condp = tag-name
+      ;  :head (into [tag-name attrs]
+      ;              (->> element
+      ;                   .childNodes
+      ;                   (map #(-> % (to-component )))
+      ;                   (remove nil?)
+      ;                   vec
+      ;                   not-empty))
+      ;  (into [tag-name attrs]
+      ;        (->> element
+      ;             .childNodes
+      ;             (map #(-> % (to-component )))
+      ;             (remove nil?)
+      ;             vec
+      ;             not-empty)))
+      ))
   Attributes
-  (to-component [attrs stack]
-    (into {} (map #(-> % (to-component stack)) attrs)))
+  (to-component [attrs]
+    (into {} (map #(-> % (to-component )) attrs)))
   Attribute
-  (to-component [attr _]
+  (to-component [attr]
     [(keyword (.getKey attr))
      (.getValue attr)])
   TextNode
-  (to-component [text-node stack]
+  (to-component [text-node]
     (let [value (.text text-node)]
       (if (not (str/blank? value))
         value)))
   DataNode
-  (to-component [data-node stack]
+  (to-component [data-node]
     (.getWholeData data-node))
   Comment
-  (to-component [comment stack]
-    (handle-comment stack
-                    (visit (parser (-> comment .getData))))
-    nil))
+  (to-component [comment]
+    (visit (parser (-> comment .getData)))))
+
+(defn- compress [^String s]
+  (let [compressor (HtmlCompressor.)]
+    (.setRemoveComments compressor false)
+    (.setPreserveLineBreaks compressor false)
+    (.replaceAll (.compress compressor s)
+                 ">\\s+<" "><")))
 
 (defn parse
   [source]
   (let [component-name (str/replace (.getName source) #"[.][^.]+$" "")
-        stack (atom [{:type :component}])
         result (-> source
                    slurp
-                   ;compress
+                   compress
                    Jsoup/parse
-                   (to-component stack))]
-    (println @stack)
+                   to-component)]
     (concat '(defn)
           [(symbol component-name) []
            {:component-will-mount '(fn [] (+ 2 a))
